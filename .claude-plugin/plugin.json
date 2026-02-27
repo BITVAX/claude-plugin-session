@@ -1,0 +1,10 @@
+{
+  "name": "session",
+  "description": "Session manager for Claude Code - list, rename, auto-title, purge and delete sessions",
+  "version": "1.0.0",
+  "author": {
+    "name": "Ignacio J. Ortega"
+  },
+  "repository": "https://github.com/BITVAX/claude-plugin-session",
+  "license": "AGPL-3"
+}
