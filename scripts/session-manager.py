@@ -970,8 +970,54 @@ def get_plan_title(plan_path):
     return ""
 
 
+def _verify_plan_link(jsonl_path, plan_filename, plan_stem):
+    """Verify a plan link by parsing JSONL entries structurally.
+
+    Returns True if the session contains a real plan interaction:
+    - An entry with slug == plan_stem (session created for this plan)
+    - A tool_use (Read/Write/Edit) with file_path pointing to the plan
+    """
+    plan_path_suffix = "/.claude/plans/" + plan_filename
+    with open(jsonl_path) as f:
+        for line in f:
+            try:
+                entry = json.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                continue
+
+            # Check 1: slug field at entry level
+            if entry.get("slug") == plan_stem:
+                return True
+
+            # Check 2: tool_use with file_path pointing to the plan
+            msg = entry.get("message")
+            if not msg or not isinstance(msg, dict):
+                continue
+            for block in msg.get("content", []):
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") != "tool_use":
+                    continue
+                inp = block.get("input")
+                if not isinstance(inp, dict):
+                    continue
+                fp = inp.get("file_path") or inp.get("path") or ""
+                if fp.endswith(plan_path_suffix):
+                    return True
+    return False
+
+
 def find_plan_sessions(plan_filename):
-    """Find sessions that reference a plan file via grep."""
+    """Find sessions that reference a plan file via tool calls or slug.
+
+    Two-phase approach for speed + precision:
+    1. grep pre-filter: quickly narrows 80+ JSONL files to a few candidates
+    2. Structured JSON verification: parses only candidates to confirm
+       real interactions (slug match or tool_use with file_path)
+
+    This avoids false positives from listing plans, IDE selections, or
+    casual mentions of the plan filename in conversation.
+    """
     sessions = []
     current_sid = os.environ.get("CLAUDE_SESSION_ID", "")
     jsonl_files = [
@@ -979,26 +1025,34 @@ def find_plan_sessions(plan_filename):
         if f.stem != "sessions-index" and f.stem != current_sid
     ]
 
-    # Use system grep for speed on large files
-    if jsonl_files:
+    plan_stem = Path(plan_filename).stem
+
+    if not jsonl_files:
+        return sessions
+
+    # Phase 1: grep pre-filter (fast — narrows to candidates)
+    candidates = []
+    try:
+        result = subprocess.run(
+            ["grep", "-l", plan_filename] + [str(f) for f in jsonl_files],
+            capture_output=True, text=True, timeout=15,
+        )
+        if result.returncode == 0:
+            for line in result.stdout.strip().split("\n"):
+                if line:
+                    candidates.append(Path(line))
+    except Exception:
+        # If grep fails, all files are candidates
+        candidates = list(jsonl_files)
+
+    # Phase 2: structured JSON verification (precise)
+    for jsonl_path in candidates:
         try:
-            result = subprocess.run(
-                ["grep", "-l", plan_filename] + [str(f) for f in jsonl_files],
-                capture_output=True, text=True, timeout=15,
-            )
-            if result.returncode == 0:
-                for line in result.stdout.strip().split("\n"):
-                    if line:
-                        sessions.append(Path(line).stem)
+            if _verify_plan_link(jsonl_path, plan_filename, plan_stem):
+                sessions.append(jsonl_path.stem)
         except Exception:
-            # Fallback: Python read
-            for jsonl in jsonl_files:
-                try:
-                    with open(jsonl) as f:
-                        if plan_filename in f.read():
-                            sessions.append(jsonl.stem)
-                except Exception:
-                    pass
+            pass
+
     return sessions
 
 
