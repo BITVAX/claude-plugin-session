@@ -1,4 +1,8 @@
 {
+  "name": "claude-plugin-session",
+  "owner": {
+    "name": "Ignacio J. Ortega"
+  },
   "plugins": [
     {
       "name": "session",
