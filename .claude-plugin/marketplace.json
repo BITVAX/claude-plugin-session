@@ -7,7 +7,7 @@
     {
       "name": "session",
       "description": "Session manager for Claude Code - list, rename, auto-title, purge and delete sessions",
-      "source": "."
+      "source": "./"
     }
   ]
 }
