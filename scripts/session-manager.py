@@ -14,6 +14,9 @@ Usage:
     session-manager.py --auto-title --session-id <id>
     session-manager.py --delete <prefix>
     session-manager.py --purge [--dry-run]
+    session-manager.py --plans [--search <term>] [--json]
+    session-manager.py --plan-info <name> [--json]
+    session-manager.py --plan-clean [--dry-run]
     session-manager.py --set-branch <branch>
     session-manager.py <prefix> <new-name>
 
@@ -947,6 +950,245 @@ def cmd_purge(dry_run=False):
     print(f"\nPurged {len(to_delete)} empty sessions, kept {kept}. Index: {before} -> {after} entries.")
 
 
+# ── Plan operations ──────────────────────────────────────────────────
+
+PLANS_DIR = Path.home() / ".claude" / "plans"
+
+
+def get_plan_title(plan_path):
+    """Extract title from a plan markdown file."""
+    try:
+        with open(plan_path) as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("# Plan: "):
+                    return line[8:]
+                if line.startswith("# "):
+                    return line[2:]
+    except Exception:
+        pass
+    return ""
+
+
+def find_plan_sessions(plan_filename):
+    """Find sessions that reference a plan file via grep."""
+    sessions = []
+    current_sid = os.environ.get("CLAUDE_SESSION_ID", "")
+    jsonl_files = [
+        f for f in PROJECT_DIR.glob("*.jsonl")
+        if f.stem != "sessions-index" and f.stem != current_sid
+    ]
+
+    # Use system grep for speed on large files
+    if jsonl_files:
+        try:
+            result = subprocess.run(
+                ["grep", "-l", plan_filename] + [str(f) for f in jsonl_files],
+                capture_output=True, text=True, timeout=15,
+            )
+            if result.returncode == 0:
+                for line in result.stdout.strip().split("\n"):
+                    if line:
+                        sessions.append(Path(line).stem)
+        except Exception:
+            # Fallback: Python read
+            for jsonl in jsonl_files:
+                try:
+                    with open(jsonl) as f:
+                        if plan_filename in f.read():
+                            sessions.append(jsonl.stem)
+                except Exception:
+                    pass
+    return sessions
+
+
+def get_session_title(session_id):
+    """Get session title from the index."""
+    data = load_index()
+    for e in data.get("entries", []):
+        if e["sessionId"] == session_id:
+            return e.get("summary", "") or e.get("firstPrompt", "")[:60]
+    return ""
+
+
+def cmd_plans(search=None, as_json=False):
+    """List all plan files with metadata and linked sessions."""
+    if not PLANS_DIR.exists():
+        if as_json:
+            print("[]")
+        else:
+            print("No plans directory found.")
+        return
+
+    plans = sorted(PLANS_DIR.glob("*.md"), key=lambda f: f.stat().st_mtime, reverse=True)
+    if not plans:
+        if as_json:
+            print("[]")
+        else:
+            print("No plans found.")
+        return
+
+    results = []
+    for plan_path in plans:
+        title = get_plan_title(plan_path)
+        name = plan_path.stem
+        stat = plan_path.stat()
+        size_kb = stat.st_size / 1024
+        modified = datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d")
+        linked = find_plan_sessions(plan_path.name)
+
+        # Build session info
+        session_info = []
+        for sid in linked:
+            stitle = get_session_title(sid)
+            session_info.append({"sessionId": sid, "title": stitle})
+
+        results.append({
+            "name": name,
+            "filename": plan_path.name,
+            "title": title,
+            "modified": modified,
+            "sizeKb": round(size_kb, 1),
+            "sessions": session_info,
+        })
+
+    # Filter by search term
+    if search:
+        term = search.lower()
+        results = [
+            r for r in results
+            if term in r["name"].lower()
+            or term in r["title"].lower()
+            or any(term in s["title"].lower() for s in r["sessions"])
+        ]
+
+    if as_json:
+        print(json.dumps(results, indent=2))
+        return
+
+    if search:
+        print(f'Filtro: "{search}" ({len(results)} resultados)\n')
+
+    for r in results:
+        scount = len(r["sessions"])
+        sess_str = ", ".join(s["sessionId"][:8] for s in r["sessions"]) if scount else "-"
+        title_display = r["title"][:45] if r["title"] else "(sin titulo)"
+        print(f"  {r['name'][:30]:<30s}  {r['modified']}  {r['sizeKb']:>6.1f}KB  {scount} sess  {title_display}")
+        if scount and not search:
+            for s in r["sessions"][:3]:
+                stitle = s["title"][:50] if s["title"] else "(sin titulo)"
+                print(f"    -> {s['sessionId'][:8]} {stitle}")
+            if scount > 3:
+                print(f"    ... +{scount - 3} mas")
+
+    print(f"\nTotal: {len(results)} planes")
+
+
+def cmd_plan_info(name, as_json=False):
+    """Show detailed info about a specific plan."""
+    # Find matching plan
+    matches = list(PLANS_DIR.glob(f"{name}*.md"))
+    if not matches:
+        print(f'ERROR: No plan found matching "{name}"', file=sys.stderr)
+        sys.exit(1)
+    if len(matches) > 1:
+        print(f'ERROR: {len(matches)} plans match "{name}":', file=sys.stderr)
+        for m in matches:
+            print(f"  {m.stem}", file=sys.stderr)
+        sys.exit(1)
+
+    plan_path = matches[0]
+    title = get_plan_title(plan_path)
+    stat = plan_path.stat()
+    size_kb = stat.st_size / 1024
+    modified = datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M")
+    linked = find_plan_sessions(plan_path.name)
+
+    # Read preview
+    preview = ""
+    try:
+        with open(plan_path) as f:
+            preview = f.read(500)
+    except Exception:
+        pass
+
+    session_info = []
+    for sid in linked:
+        stitle = get_session_title(sid)
+        session_info.append({"sessionId": sid, "title": stitle})
+
+    if as_json:
+        print(json.dumps({
+            "name": plan_path.stem,
+            "filename": plan_path.name,
+            "title": title,
+            "modified": modified,
+            "sizeKb": round(size_kb, 1),
+            "sessions": session_info,
+            "preview": preview,
+            "fullPath": str(plan_path),
+        }, indent=2))
+        return
+
+    print(f"Plan:     {plan_path.stem}")
+    print(f"Title:    {title or '(sin titulo)'}")
+    print(f"Modified: {modified}")
+    print(f"Size:     {size_kb:.1f} KB")
+    print(f"Path:     {plan_path}")
+    print(f"Sessions: {len(linked)}")
+    for s in session_info:
+        stitle = s["title"][:50] if s["title"] else "(sin titulo)"
+        print(f"  -> {s['sessionId'][:8]} {stitle}")
+    if preview:
+        print(f"\n--- Preview ---")
+        print(preview)
+        if len(preview) >= 500:
+            print("...")
+
+
+def cmd_plan_clean(dry_run=False):
+    """Clean up orphaned plans (no linked sessions)."""
+    if not PLANS_DIR.exists():
+        print("No plans directory found.")
+        return
+
+    plans = list(PLANS_DIR.glob("*.md"))
+    if not plans:
+        print("No plans found.")
+        return
+
+    orphans = []
+    for plan_path in sorted(plans):
+        linked = find_plan_sessions(plan_path.name)
+        if not linked:
+            title = get_plan_title(plan_path)
+            size_kb = plan_path.stat().st_size / 1024
+            orphans.append((plan_path, title, size_kb))
+
+    if not orphans:
+        print(f"No orphaned plans found ({len(plans)} plans, all linked to sessions).")
+        return
+
+    for path, title, size_kb in orphans:
+        action = "would move to .trash" if dry_run else "moved to .trash"
+        display = title[:40] if title else "(sin titulo)"
+        print(f"  {path.stem[:30]:<30s}  {size_kb:>5.1f}KB  {display}  -> {action}")
+
+    if dry_run:
+        print(f"\nDry run: {len(orphans)} orphaned plans would be cleaned.")
+        return
+
+    trash_dir = PLANS_DIR / ".trash"
+    trash_dir.mkdir(exist_ok=True)
+
+    for path, _, _ in orphans:
+        dest = trash_dir / path.name
+        path.rename(dest)
+
+    remaining = len(list(PLANS_DIR.glob("*.md")))
+    print(f"\nMoved {len(orphans)} orphaned plans to .trash/. Remaining: {remaining} plans.")
+
+
 def cmd_set_branch(new_branch):
     """Change gitBranch on ALL sessions."""
     data = load_index()
@@ -1009,6 +1251,9 @@ def parse_args():
         "dry_run": False,
         "auto_title": False,
         "themes": False,
+        "plans": False,
+        "plan_info": False,
+        "plan_clean": False,
         "session_id": None,
         "set_branch": None,
         "project_dir": None,
@@ -1048,6 +1293,12 @@ def parse_args():
             opts["auto_title"] = True
         elif arg == "--themes":
             opts["themes"] = True
+        elif arg == "--plans":
+            opts["plans"] = True
+        elif arg == "--plan-info":
+            opts["plan_info"] = True
+        elif arg == "--plan-clean":
+            opts["plan_clean"] = True
         elif arg == "--session-id" and i + 1 < len(args):
             i += 1
             opts["session_id"] = args[i]
@@ -1084,6 +1335,7 @@ if __name__ == "__main__":
         opts["smart"] or opts["rebuild"] or opts["list"] or opts["list_untitled"]
         or opts["status"] or opts["info"] or opts["messages"] or opts["delete"]
         or opts["purge"] or opts["set_branch"] or opts["auto_title"] or opts["themes"]
+        or opts["plans"] or opts["plan_info"] or opts["plan_clean"]
         or opts["positional"]
     )
 
@@ -1109,7 +1361,16 @@ if __name__ == "__main__":
     # Dispatch
     j = opts["json_output"]
 
-    if opts["themes"]:
+    if opts["plans"]:
+        cmd_plans(search=opts["search"], as_json=j)
+    elif opts["plan_info"]:
+        if not opts["positional"]:
+            print("ERROR: --plan-info requires a plan name", file=sys.stderr)
+            sys.exit(1)
+        cmd_plan_info(opts["positional"][0], as_json=j)
+    elif opts["plan_clean"]:
+        cmd_plan_clean(dry_run=opts["dry_run"])
+    elif opts["themes"]:
         cmd_themes(as_json=j)
     elif opts["rebuild"]:
         cmd_rebuild()
